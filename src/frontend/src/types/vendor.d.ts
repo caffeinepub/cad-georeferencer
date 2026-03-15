@@ -52,6 +52,7 @@ interface MaplibreMarker {
   getLngLat(): { lat: number; lng: number };
   on(event: string, handler: () => void): void;
   setDraggable(draggable: boolean): this;
+  getElement(): HTMLElement;
 }
 
 declare const turf: {

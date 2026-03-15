@@ -594,6 +594,7 @@ export function MapViewer({
   const rotHoldAccumRef = useRef(0);
   const rotHoldPivotRef = useRef<{ lng: number; lat: number } | null>(null);
   const rotHoldBaseGeojsonRef = useRef<GeoJSONFeatureCollection | null>(null);
+  const skipRebuildRef = useRef(false);
 
   // CTRL+pivot drag refs
   const ctrlPivotDragRef = useRef(false);
@@ -951,7 +952,28 @@ export function MapViewer({
       if (!drag) return;
       bboxHandleDragRef.current = null;
       const { anchorLng, anchorLat, currentScaleX, currentScaleY } = drag;
+      // Always show markers again after scale drag ends
+      for (const m of markersRef.current) {
+        m.getElement().style.opacity = "1";
+        m.getElement().style.pointerEvents = "";
+      }
+
       if (currentScaleX !== 1 || currentScaleY !== 1) {
+        // Commit the scaled geojson so rebuildAndPushOverlay doesn't recompute
+        const scaledGeojson = applyNonUniformScale(
+          drag.startGeojson,
+          anchorLng,
+          anchorLat,
+          currentScaleX,
+          currentScaleY,
+        );
+        const m2 = mapRef.current;
+        if (m2) {
+          baseGeoJsonRef.current = scaledGeojson;
+          pushGeojsonRef.current(m2, scaledGeojson);
+        }
+        skipRebuildRef.current = true;
+
         onUpdateAllMapPointsRef.current((pts) =>
           pts.map((p) => ({
             ...p,
@@ -1092,6 +1114,11 @@ export function MapViewer({
         return;
       }
 
+      // Skip full rebuild if a rotation/scale just committed its own geojson
+      if (skipRebuildRef.current) {
+        skipRebuildRef.current = false;
+        return;
+      }
       const geojson = buildRubberSheetGeoJson(pts, dxf, lockScaleRef.current);
       if (!geojson) return;
 
@@ -1592,12 +1619,14 @@ export function MapViewer({
     const pivot = rotHoldPivotRef.current;
     const map = mapRef.current;
     if (!base || !pivot || !map) return;
-    // turf.transformRotate: negative = clockwise (matches screen coords)
-    const rotated = turf.transformRotate(base, -totalAccumDeg, {
+
+    const rotated = turf.transformRotate(base, totalAccumDeg, {
       pivot: [pivot.lng, pivot.lat],
     });
     pushGeojsonRef.current(map, rotated as GeoJSONFeatureCollection);
-    setDisplayRotDeg(totalAccumDeg);
+    // Normalize display to 0–359 range
+    const displayVal = totalAccumDeg % 360;
+    setDisplayRotDeg(displayVal);
   };
 
   const startHoldRotate = (dir: 1 | -1) => {
@@ -1620,6 +1649,12 @@ export function MapViewer({
     ) as GeoJSONFeatureCollection;
     rotHoldAccumRef.current = 0;
 
+    // Hide all control point markers during rotation for clarity
+    for (const m of markersRef.current) {
+      m.getElement().style.opacity = "0";
+      m.getElement().style.pointerEvents = "none";
+    }
+
     // Apply first step immediately
     rotHoldAccumRef.current += dir;
     applyRotationPreview(rotHoldAccumRef.current);
@@ -1640,8 +1675,38 @@ export function MapViewer({
     }
     const accum = rotHoldAccumRef.current;
     const pivot = rotHoldPivotRef.current;
-    if (accum === 0 || !pivot) return;
+    const base = rotHoldBaseGeojsonRef.current;
 
+    // Always show markers again
+    for (const m of markersRef.current) {
+      m.getElement().style.opacity = "1";
+      m.getElement().style.pointerEvents = "";
+    }
+
+    if (accum === 0 || !pivot || !base) {
+      rotHoldAccumRef.current = 0;
+      rotHoldBaseGeojsonRef.current = null;
+      setDisplayRotDeg(0);
+      return;
+    }
+
+    // Commit the final rotated geojson as the new base so rebuildAndPushOverlay
+    // doesn't recompute from scratch (which would cause a visual jump)
+    const finalGeojson = turf.transformRotate(base, accum, {
+      pivot: [pivot.lng, pivot.lat],
+    }) as GeoJSONFeatureCollection;
+    const map = mapRef.current;
+    if (map) {
+      baseGeoJsonRef.current = finalGeojson;
+      pushGeojsonRef.current(map, finalGeojson);
+    }
+    // Tell rebuildAndPushOverlay to skip one cycle since we've already committed
+    skipRebuildRef.current = true;
+
+    // Update control point lat/lngs to match the rotated geometry.
+    // Clockwise rotation by accum degrees in geographic coords:
+    //   x' = cos(θ)*x + sin(θ)*y
+    //   y' = -sin(θ)*x + cos(θ)*y
     const rad = (accum * Math.PI) / 180;
     const cos = Math.cos(rad);
     const sin = Math.sin(rad);
@@ -1778,16 +1843,6 @@ export function MapViewer({
             }
           >
             <RotateCw size={14} />
-          </MapToolButton>
-          <MapToolButton
-            ocid="map.scale_tool.button"
-            label="Scale Overlay"
-            active={manualTool === "scale"}
-            onClick={() =>
-              setManualTool((t) => (t === "scale" ? "none" : "scale"))
-            }
-          >
-            <Maximize2 size={14} />
           </MapToolButton>
 
           <div
@@ -2067,6 +2122,11 @@ export function MapViewer({
                       currentScaleY: 1,
                       startGeojson: currentGeojsonRef.current,
                     };
+                    // Hide control point markers during scale drag
+                    for (const mk of markersRef.current) {
+                      mk.getElement().style.opacity = "0";
+                      mk.getElement().style.pointerEvents = "none";
+                    }
                   }}
                 />
               );
