@@ -1,0 +1,147 @@
+@import url("https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600&display=swap");
+@import "leaflet/dist/leaflet.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Deep navy engineering theme */
+    --background: 17.4 0.025 243;
+    --foreground: 97 0.005 240;
+
+    --card: 20 0.03 243;
+    --card-foreground: 97 0.005 240;
+
+    --popover: 22 0.035 243;
+    --popover-foreground: 97 0.005 240;
+
+    --primary: 85 0.22 195;
+    --primary-foreground: 17.4 0.025 243;
+
+    --secondary: 28 0.04 243;
+    --secondary-foreground: 85 0.15 195;
+
+    --muted: 26 0.03 243;
+    --muted-foreground: 65 0.05 240;
+
+    --accent: 85 0.22 195;
+    --accent-foreground: 17.4 0.025 243;
+
+    --destructive: 55 0.22 25;
+    --destructive-foreground: 97 0.005 240;
+
+    --border: 30 0.04 243;
+    --input: 30 0.04 243;
+    --ring: 85 0.22 195;
+
+    --radius: 4px;
+
+    --chart-1: 85 0.22 195;
+    --chart-2: 75 0.18 220;
+    --chart-3: 65 0.15 200;
+    --chart-4: 55 0.12 180;
+    --chart-5: 45 0.1 160;
+
+    --sidebar: 20 0.03 243;
+    --sidebar-foreground: 97 0.005 240;
+    --sidebar-primary: 85 0.22 195;
+    --sidebar-primary-foreground: 17.4 0.025 243;
+    --sidebar-accent: 28 0.04 243;
+    --sidebar-accent-foreground: 85 0.15 195;
+    --sidebar-border: 30 0.04 243;
+    --sidebar-ring: 85 0.22 195;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+  }
+}
+
+/* Blueprint grid background */
+.blueprint-bg {
+  background-color: oklch(17.4% 0.025 243);
+  background-image: linear-gradient(
+      oklch(30% 0.04 195 / 0.15) 1px,
+      transparent 1px
+    ), linear-gradient(90deg, oklch(30% 0.04 195 / 0.15) 1px, transparent 1px),
+    linear-gradient(oklch(30% 0.04 195 / 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, oklch(30% 0.04 195 / 0.06) 1px, transparent 1px);
+  background-size: 100px 100px, 100px 100px, 20px 20px, 20px 20px;
+  background-position: -1px -1px, -1px -1px, -1px -1px, -1px -1px;
+}
+
+/* Leaflet overrides for dark theme */
+.leaflet-container {
+  background: oklch(20% 0.03 243) !important;
+}
+
+.leaflet-control-attribution {
+  background: oklch(20% 0.03 243 / 0.8) !important;
+  color: oklch(65% 0.05 240) !important;
+  font-size: 10px;
+}
+
+.leaflet-control-zoom a {
+  background: oklch(22% 0.035 243) !important;
+  color: oklch(97% 0.005 240) !important;
+  border-color: oklch(30% 0.04 243) !important;
+}
+
+.leaflet-control-zoom a:hover {
+  background: oklch(28% 0.04 243) !important;
+}
+
+/* Custom leaflet pin styles */
+.cad-pin {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50% 50% 50% 0;
+  transform: rotate(-45deg);
+  background: oklch(85% 0.22 195);
+  border: 2px solid oklch(17.4% 0.025 243);
+  box-shadow: 0 0 8px oklch(85% 0.22 195 / 0.5);
+}
+
+.cad-pin span {
+  transform: rotate(45deg);
+  color: oklch(17.4% 0.025 243);
+  font-weight: 700;
+  font-size: 11px;
+  font-family: "JetBrains Mono", monospace;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: oklch(20% 0.03 243);
+}
+::-webkit-scrollbar-thumb {
+  background: oklch(35% 0.06 243);
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: oklch(50% 0.1 195);
+}

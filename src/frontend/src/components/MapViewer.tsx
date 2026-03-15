@@ -1,0 +1,1884 @@
+import { Lock, Maximize2, Move, Palette, RotateCw, Unlock } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { PickingState } from "../hooks/useControlPoints";
+import type { DxfData } from "../utils/dxfRenderer";
+import { applyTPS, computeTPS } from "../utils/tpsTransform";
+import type { TPSParams } from "../utils/tpsTransform";
+import type { ControlPoint } from "../utils/wld3";
+import { computeAffine } from "../utils/wld3";
+
+const MAPTILER_KEY = "MVmvVxNoLWy9Lc9WZ6nc";
+const MARKER_COLOR = "#FF8C00";
+const MARKER_TEXT_COLOR = "#1a0a00";
+const SOURCE_ID = "dxf-source";
+const LAYER_ID = "dxf-layer";
+const DEFAULT_OVERLAY_COLOR = "#96D2E6";
+const DEFAULT_OVERLAY_WIDTH = 1;
+
+const BASEMAPS = [
+  {
+    id: "hybrid",
+    label: "Satellite",
+    url: `https://api.maptiler.com/maps/hybrid/style.json?key=${MAPTILER_KEY}`,
+  },
+  {
+    id: "streets",
+    label: "Streets",
+    url: `https://api.maptiler.com/maps/streets-v2/style.json?key=${MAPTILER_KEY}`,
+  },
+  {
+    id: "light",
+    label: "Light",
+    url: `https://api.maptiler.com/maps/dataviz-light/style.json?key=${MAPTILER_KEY}`,
+  },
+];
+
+type ManualTool = "none" | "move" | "rotate" | "scale";
+
+interface MapViewerProps {
+  pickingState: PickingState;
+  points: ControlPoint[];
+  dxfData: DxfData | null;
+  onMapClick: (lat: number, lng: number) => void;
+  onUpdateMapPoint: (id: number, lat: number, lng: number) => void;
+  onUpdateAllMapPoints: (
+    updater: (pts: ControlPoint[]) => ControlPoint[],
+  ) => void;
+}
+
+interface HandleInfo {
+  x: number;
+  y: number;
+  lng: number;
+  lat: number;
+}
+
+interface BboxHandleDrag {
+  handleIndex: number;
+  anchorLng: number;
+  anchorLat: number;
+  anchorScreenX: number;
+  anchorScreenY: number;
+  origDist: number;
+  currentScaleFactor: number;
+  startGeojson: GeoJSONFeatureCollection;
+}
+
+// ── Color utilities ──────────────────────────────────────────────────────────
+function hexToHsv(hex: string): [number, number, number] {
+  const r = Number.parseInt(hex.slice(1, 3), 16) / 255;
+  const g = Number.parseInt(hex.slice(3, 5), 16) / 255;
+  const b = Number.parseInt(hex.slice(5, 7), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const v = max;
+  const s = max === 0 ? 0 : (max - min) / max;
+  let h = 0;
+  if (max !== min) {
+    if (max === r) h = ((g - b) / (max - min)) * 60;
+    else if (max === g) h = ((b - r) / (max - min) + 2) * 60;
+    else h = ((r - g) / (max - min) + 4) * 60;
+    if (h < 0) h += 360;
+  }
+  return [h, s, v];
+}
+
+function hsvToHex(h: number, s: number, v: number): string {
+  const h60 = h / 60;
+  const i = Math.floor(h60) % 6;
+  const f = h60 - Math.floor(h60);
+  const p = v * (1 - s);
+  const q = v * (1 - f * s);
+  const t = v * (1 - (1 - f) * s);
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (i === 0) {
+    r = v;
+    g = t;
+    b = p;
+  } else if (i === 1) {
+    r = q;
+    g = v;
+    b = p;
+  } else if (i === 2) {
+    r = p;
+    g = v;
+    b = t;
+  } else if (i === 3) {
+    r = p;
+    g = q;
+    b = v;
+  } else if (i === 4) {
+    r = t;
+    g = p;
+    b = v;
+  } else {
+    r = v;
+    g = p;
+    b = q;
+  }
+  const toHex = (x: number) =>
+    Math.round(x * 255)
+      .toString(16)
+      .padStart(2, "0");
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+// ── HSV Color Picker component ───────────────────────────────────────────────
+function HsvColorPicker({
+  color,
+  onChange,
+}: {
+  color: string;
+  onChange: (hex: string) => void;
+}) {
+  const [hsv, setHsv] = useState<[number, number, number]>(() =>
+    hexToHsv(color),
+  );
+  const [hexInput, setHexInput] = useState(color);
+  const svCanvasRef = useRef<HTMLCanvasElement>(null);
+  const hueCanvasRef = useRef<HTMLCanvasElement>(null);
+  const svDragRef = useRef(false);
+  const hueDragRef = useRef(false);
+
+  useEffect(() => {
+    setHsv(hexToHsv(color));
+    setHexInput(color);
+  }, [color]);
+
+  useEffect(() => {
+    const canvas = svCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const W = canvas.width;
+    const H = canvas.height;
+    const grS = ctx.createLinearGradient(0, 0, W, 0);
+    grS.addColorStop(0, "#ffffff");
+    grS.addColorStop(1, hsvToHex(hsv[0], 1, 1));
+    ctx.fillStyle = grS;
+    ctx.fillRect(0, 0, W, H);
+    const grV = ctx.createLinearGradient(0, 0, 0, H);
+    grV.addColorStop(0, "rgba(0,0,0,0)");
+    grV.addColorStop(1, "rgba(0,0,0,1)");
+    ctx.fillStyle = grV;
+    ctx.fillRect(0, 0, W, H);
+    const cx = hsv[1] * W;
+    const cy = (1 - hsv[2]) * H;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+    ctx.strokeStyle = "white";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(0,0,0,0.5)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }, [hsv]);
+
+  useEffect(() => {
+    const canvas = hueCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const W = canvas.width;
+    const H = canvas.height;
+    const gr = ctx.createLinearGradient(0, 0, W, 0);
+    for (let i = 0; i <= 6; i++) {
+      gr.addColorStop(i / 6, `hsl(${i * 60},100%,50%)`);
+    }
+    ctx.fillStyle = gr;
+    ctx.fillRect(0, 0, W, H);
+    const cx = (hsv[0] / 360) * W;
+    ctx.fillStyle = "white";
+    ctx.fillRect(cx - 2, 0, 4, H);
+    ctx.fillStyle = "rgba(0,0,0,0.5)";
+    ctx.fillRect(cx - 1, 0, 2, H);
+  }, [hsv]);
+
+  function pickSV(e: React.MouseEvent<HTMLCanvasElement>) {
+    const canvas = svCanvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const s = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const v = Math.max(
+      0,
+      Math.min(1, 1 - (e.clientY - rect.top) / rect.height),
+    );
+    const newHsv: [number, number, number] = [hsv[0], s, v];
+    setHsv(newHsv);
+    const hex = hsvToHex(...newHsv);
+    setHexInput(hex);
+    onChange(hex);
+  }
+
+  function pickHue(e: React.MouseEvent<HTMLCanvasElement>) {
+    const canvas = hueCanvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const h = Math.max(
+      0,
+      Math.min(359.9, ((e.clientX - rect.left) / rect.width) * 360),
+    );
+    const newHsv: [number, number, number] = [h, hsv[1], hsv[2]];
+    setHsv(newHsv);
+    const hex = hsvToHex(...newHsv);
+    setHexInput(hex);
+    onChange(hex);
+  }
+
+  function handleHexInput(val: string) {
+    setHexInput(val);
+    if (/^#[0-9a-fA-F]{6}$/.test(val)) {
+      setHsv(hexToHsv(val));
+      onChange(val);
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <canvas
+        ref={svCanvasRef}
+        width={192}
+        height={120}
+        style={{ borderRadius: 4, cursor: "crosshair", display: "block" }}
+        onMouseDown={(e) => {
+          svDragRef.current = true;
+          pickSV(e);
+        }}
+        onMouseMove={(e) => {
+          if (svDragRef.current) pickSV(e);
+        }}
+        onMouseUp={() => {
+          svDragRef.current = false;
+        }}
+        onMouseLeave={() => {
+          svDragRef.current = false;
+        }}
+      />
+      <canvas
+        ref={hueCanvasRef}
+        width={192}
+        height={12}
+        style={{ borderRadius: 4, cursor: "ew-resize", display: "block" }}
+        onMouseDown={(e) => {
+          hueDragRef.current = true;
+          pickHue(e);
+        }}
+        onMouseMove={(e) => {
+          if (hueDragRef.current) pickHue(e);
+        }}
+        onMouseUp={() => {
+          hueDragRef.current = false;
+        }}
+        onMouseLeave={() => {
+          hueDragRef.current = false;
+        }}
+      />
+      <div className="flex items-center gap-2">
+        <div
+          style={{
+            width: 24,
+            height: 24,
+            borderRadius: 4,
+            background: color,
+            border: "1px solid rgba(255,140,0,0.4)",
+            flexShrink: 0,
+          }}
+        />
+        <input
+          type="text"
+          value={hexInput}
+          onChange={(e) => handleHexInput(e.target.value)}
+          maxLength={7}
+          style={{
+            background: "rgba(255,255,255,0.07)",
+            border: "1px solid rgba(255,140,0,0.3)",
+            color: "rgba(255,140,0,0.9)",
+            fontFamily: "monospace",
+            fontSize: 11,
+            padding: "2px 6px",
+            borderRadius: 4,
+            width: "100%",
+            outline: "none",
+          }}
+          data-ocid="map.overlay_color.input"
+        />
+      </div>
+    </div>
+  );
+}
+
+// ── Coordinate validation ──────────────────────────────────────────────────
+function isValidLngLat(lng: number, lat: number): boolean {
+  return (
+    Number.isFinite(lng) &&
+    Number.isFinite(lat) &&
+    lng >= -180 &&
+    lng <= 180 &&
+    lat >= -90 &&
+    lat <= 90
+  );
+}
+
+// ── GeoJSON builder ───────────────────────────────────────────────────────────
+function buildBaseGeoJson(
+  dxfData: DxfData,
+  transformFn: (cadX: number, cadY: number) => [number, number] | null,
+): GeoJSONFeatureCollection {
+  const features: GeoJSONFeature[] = [];
+
+  function transformPt(cadX: number, cadY: number): [number, number] | null {
+    const result = transformFn(cadX, cadY);
+    if (!result) return null;
+    if (!isValidLngLat(result[0], result[1])) return null;
+    return result;
+  }
+
+  for (const entity of dxfData.entities) {
+    const e = entity as any;
+    try {
+      switch (entity.type) {
+        case "LINE": {
+          const x1 = e.vertices?.[0]?.x ?? e.start?.x ?? 0;
+          const y1 = e.vertices?.[0]?.y ?? e.start?.y ?? 0;
+          const x2 = e.vertices?.[1]?.x ?? e.end?.x ?? 0;
+          const y2 = e.vertices?.[1]?.y ?? e.end?.y ?? 0;
+          const p1 = transformPt(x1, y1);
+          const p2 = transformPt(x2, y2);
+          if (!p1 || !p2) break;
+          if (p1[0] === p2[0] && p1[1] === p2[1]) break;
+          features.push(turf.lineString([p1, p2]));
+          break;
+        }
+        case "LWPOLYLINE":
+        case "POLYLINE": {
+          const verts = e.vertices || [];
+          if (verts.length < 2) break;
+          const rawCoords = verts
+            .map((v: any) => transformPt(v.x ?? 0, v.y ?? 0))
+            .filter(
+              (pt: [number, number] | null): pt is [number, number] =>
+                pt !== null,
+            );
+          if (rawCoords.length < 2) break;
+          if (e.shape || e.closed) rawCoords.push(rawCoords[0]);
+          features.push(turf.lineString(rawCoords));
+          break;
+        }
+        case "CIRCLE": {
+          const cx = e.center?.x ?? 0;
+          const cy = e.center?.y ?? 0;
+          const r = e.radius ?? 1;
+          const segments = 64;
+          const rawCoords: [number, number][] = [];
+          for (let i = 0; i <= segments; i++) {
+            const angle = (i / segments) * Math.PI * 2;
+            const pt = transformPt(
+              cx + r * Math.cos(angle),
+              cy + r * Math.sin(angle),
+            );
+            if (pt) rawCoords.push(pt);
+          }
+          if (rawCoords.length >= 2) features.push(turf.lineString(rawCoords));
+          break;
+        }
+        case "ARC": {
+          const cx = e.center?.x ?? 0;
+          const cy = e.center?.y ?? 0;
+          const r = e.radius ?? 1;
+          const startDeg = e.startAngle ?? 0;
+          const endDeg = e.endAngle ?? 360;
+          const startRad = (startDeg * Math.PI) / 180;
+          let endRad = (endDeg * Math.PI) / 180;
+          if (endRad <= startRad) endRad += Math.PI * 2;
+          const segments = 48;
+          const rawCoords: [number, number][] = [];
+          for (let i = 0; i <= segments; i++) {
+            const angle = startRad + (i / segments) * (endRad - startRad);
+            const pt = transformPt(
+              cx + r * Math.cos(angle),
+              cy + r * Math.sin(angle),
+            );
+            if (pt) rawCoords.push(pt);
+          }
+          if (rawCoords.length >= 2) features.push(turf.lineString(rawCoords));
+          break;
+        }
+      }
+    } catch {
+      // skip malformed entity
+    }
+  }
+
+  return turf.featureCollection(features);
+}
+
+function makeAffineTransformFn(params: {
+  A: number;
+  B: number;
+  C: number;
+  D: number;
+  E: number;
+  F: number;
+}): (cadX: number, cadY: number) => [number, number] | null {
+  return (cadX, cadY) => {
+    const lng = params.A * cadX + params.B * cadY + params.C;
+    const lat = params.D * cadX + params.E * cadY + params.F;
+    return [lng, lat];
+  };
+}
+
+function makeTPSTransformFn(
+  tpsParams: TPSParams,
+): (cadX: number, cadY: number) => [number, number] | null {
+  return (cadX, cadY) => applyTPS(tpsParams, cadX, cadY);
+}
+
+function applyManualDelta(
+  base: GeoJSONFeatureCollection,
+  delta: {
+    dlng: number;
+    dlat: number;
+    rotateDeg: number;
+    scaleFactor: number;
+    pivotLng: number;
+    pivotLat: number;
+  },
+): GeoJSONFeatureCollection {
+  let result = base;
+
+  if (delta.dlng !== 0 || delta.dlat !== 0) {
+    const clone = JSON.parse(
+      JSON.stringify(result),
+    ) as GeoJSONFeatureCollection;
+    for (const feat of clone.features) {
+      if (feat.geometry?.type === "LineString") {
+        const g = feat.geometry as any;
+        g.coordinates = g.coordinates.map(([lng, lat]: [number, number]) => [
+          lng + delta.dlng,
+          lat + delta.dlat,
+        ]);
+      }
+    }
+    result = clone;
+  }
+
+  if (delta.rotateDeg !== 0) {
+    result = turf.transformRotate(result, delta.rotateDeg, {
+      pivot: [delta.pivotLng, delta.pivotLat],
+    });
+  }
+
+  if (delta.scaleFactor !== 1) {
+    result = turf.transformScale(result, delta.scaleFactor, {
+      origin: [delta.pivotLng, delta.pivotLat],
+    });
+  }
+
+  return result;
+}
+
+function computePivot(pts: ControlPoint[]): { lng: number; lat: number } {
+  if (pts.length === 0) return { lng: 0, lat: 0 };
+  const lngs = pts.map((p) => p.mapLng);
+  const lats = pts.map((p) => p.mapLat);
+  return {
+    lng: (Math.min(...lngs) + Math.max(...lngs)) / 2,
+    lat: (Math.min(...lats) + Math.max(...lats)) / 2,
+  };
+}
+
+// ── Rubber-sheet: build GeoJSON using TPS (or affine fallback) ─────────────
+// lockScale=true forces pure affine (no TPS warping)
+function buildRubberSheetGeoJson(
+  pts: ControlPoint[],
+  dxf: DxfData,
+  lockScale = false,
+): GeoJSONFeatureCollection | null {
+  if (pts.length < 3) return null;
+
+  if (lockScale) {
+    const affineParams = computeAffine(pts);
+    if (!affineParams) return null;
+    return buildBaseGeoJson(dxf, makeAffineTransformFn(affineParams));
+  }
+
+  const cpInput = pts.map((p) => ({
+    cadX: p.cadX,
+    cadY: p.cadY,
+    mapLng: p.mapLng,
+    mapLat: p.mapLat,
+  }));
+  const tpsParams = computeTPS(cpInput);
+  if (tpsParams) {
+    return buildBaseGeoJson(dxf, makeTPSTransformFn(tpsParams));
+  }
+  const affineParams = computeAffine(pts);
+  if (!affineParams) return null;
+  return buildBaseGeoJson(dxf, makeAffineTransformFn(affineParams));
+}
+
+export function MapViewer({
+  pickingState,
+  points,
+  dxfData,
+  onMapClick,
+  onUpdateMapPoint,
+  onUpdateAllMapPoints,
+}: MapViewerProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<MaplibreMap | null>(null);
+  const markersRef = useRef<MaplibreMarker[]>([]);
+  const [activeBasemap, setActiveBasemap] = useState("hybrid");
+  const [manualTool, setManualTool] = useState<ManualTool>("none");
+  const [overlayColor, setOverlayColor] = useState(DEFAULT_OVERLAY_COLOR);
+  const [overlayWidth, setOverlayWidth] = useState(DEFAULT_OVERLAY_WIDTH);
+  const [showStylePanel, setShowStylePanel] = useState(false);
+
+  // ── NEW: Lock Scale state ─────────────────────────────────────────────────
+  const [lockScale, setLockScale] = useState(true);
+  const lockScaleRef = useRef(true);
+
+  // ── NEW: Rotation wheel + scale bbox overlay state ────────────────────────
+  const [pivotScreen, setPivotScreen] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
+  const [bboxHandles, setBboxHandles] = useState<HandleInfo[] | null>(null);
+  const [rotateTooltip, setRotateTooltip] = useState<{
+    x: number;
+    y: number;
+    angle: number;
+  } | null>(null);
+
+  // NEW: drag refs
+  const wheelDragRef = useRef<{ startX: number; startAngle: number } | null>(
+    null,
+  );
+  const bboxHandleDragRef = useRef<BboxHandleDrag | null>(null);
+
+  const pickingStateRef = useRef<PickingState>(pickingState);
+  const onMapClickRef = useRef(onMapClick);
+  const onUpdateMapPointRef = useRef(onUpdateMapPoint);
+  const onUpdateAllMapPointsRef = useRef(onUpdateAllMapPoints);
+  const pointsRef = useRef(points);
+  const manualToolRef = useRef<ManualTool>("none");
+  const dxfDataRef = useRef(dxfData);
+  const overlayColorRef = useRef(overlayColor);
+  const overlayWidthRef = useRef(overlayWidth);
+
+  const baseGeoJsonRef = useRef<GeoJSONFeatureCollection | null>(null);
+  const currentGeojsonRef = useRef<GeoJSONFeatureCollection>(
+    turf.featureCollection([]),
+  );
+  const hasAutoZoomedRef = useRef(false);
+
+  const manualDeltaRef = useRef({
+    dlng: 0,
+    dlat: 0,
+    rotateDeg: 0,
+    scaleFactor: 1,
+    pivotLng: 0,
+    pivotLat: 0,
+  });
+
+  const dragRef = useRef<{
+    isDragging: boolean;
+    mode: "global-move" | "point-rubber" | "rotate" | "scale";
+    targetPointId: number | null;
+    startLng: number;
+    startLat: number;
+    startDlng: number;
+    startDlat: number;
+    startRotateDeg: number;
+    startScaleFactor: number;
+    startAngle: number;
+    startDist: number;
+    pivotLng: number;
+    pivotLat: number;
+    origPointLng: number;
+    origPointLat: number;
+  } | null>(null);
+
+  const ghostSvgRef = useRef<SVGSVGElement | null>(null);
+
+  const setupOverlayLayersRef = useRef<(map: MaplibreMap) => void>(() => {});
+  const pushGeojsonRef = useRef<
+    (map: MaplibreMap, geojson: GeoJSONFeatureCollection) => void
+  >(() => {});
+
+  // ── Stable ref sync ───────────────────────────────────────────────────────
+  useEffect(() => {
+    pickingStateRef.current = pickingState;
+  }, [pickingState]);
+  useEffect(() => {
+    onMapClickRef.current = onMapClick;
+  }, [onMapClick]);
+  useEffect(() => {
+    onUpdateMapPointRef.current = onUpdateMapPoint;
+  }, [onUpdateMapPoint]);
+  useEffect(() => {
+    onUpdateAllMapPointsRef.current = onUpdateAllMapPoints;
+  }, [onUpdateAllMapPoints]);
+  useEffect(() => {
+    pointsRef.current = points;
+  }, [points]);
+  useEffect(() => {
+    dxfDataRef.current = dxfData;
+  }, [dxfData]);
+  useEffect(() => {
+    manualToolRef.current = manualTool;
+  }, [manualTool]);
+  useEffect(() => {
+    lockScaleRef.current = lockScale;
+  }, [lockScale]);
+  useEffect(() => {
+    overlayColorRef.current = overlayColor;
+    const map = mapRef.current;
+    if (map?.isStyleLoaded() && map.getLayer(LAYER_ID)) {
+      map.setPaintProperty(LAYER_ID, "line-color", overlayColor);
+    }
+  }, [overlayColor]);
+  useEffect(() => {
+    overlayWidthRef.current = overlayWidth;
+    const map = mapRef.current;
+    if (map?.isStyleLoaded() && map.getLayer(LAYER_ID)) {
+      map.setPaintProperty(LAYER_ID, "line-width", overlayWidth);
+    }
+  }, [overlayWidth]);
+
+  // ── RAF loop: pivot screen position (rotate tool) ─────────────────────────
+  useEffect(() => {
+    const hasOverlay = points.length >= 3 && dxfData !== null;
+    if (manualTool !== "rotate" || !hasOverlay) {
+      setPivotScreen(null);
+      return;
+    }
+    let rafId: number;
+    function tick() {
+      const map = mapRef.current;
+      if (map && pointsRef.current.length >= 3) {
+        const pivot = computePivot(pointsRef.current);
+        const pivotLng = pivot.lng + manualDeltaRef.current.dlng;
+        const pivotLat = pivot.lat + manualDeltaRef.current.dlat;
+        try {
+          const s = map.project([pivotLng, pivotLat]);
+          setPivotScreen((prev) => {
+            if (
+              !prev ||
+              Math.abs(prev.x - s.x) > 0.5 ||
+              Math.abs(prev.y - s.y) > 0.5
+            ) {
+              return { x: s.x, y: s.y };
+            }
+            return prev;
+          });
+        } catch {
+          /* ignore */
+        }
+      }
+      rafId = requestAnimationFrame(tick);
+    }
+    rafId = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(rafId);
+      setPivotScreen(null);
+    };
+  }, [manualTool, points, dxfData]);
+
+  // ── RAF loop: bbox handles (scale tool) ───────────────────────────────────
+  useEffect(() => {
+    const hasOverlay = points.length >= 3 && dxfData !== null;
+    if (manualTool !== "scale" || !hasOverlay) {
+      setBboxHandles(null);
+      return;
+    }
+    let rafId: number;
+    function tick() {
+      // Don't update handles while a handle drag is in progress
+      if (bboxHandleDragRef.current) {
+        rafId = requestAnimationFrame(tick);
+        return;
+      }
+      const map = mapRef.current;
+      const geojson = currentGeojsonRef.current;
+      if (map && geojson.features.length > 0) {
+        try {
+          const bbox = turf.bbox(geojson);
+          if ((bbox as number[]).every(Number.isFinite)) {
+            const [minLng, minLat, maxLng, maxLat] = bbox;
+            const midLng = (minLng + maxLng) / 2;
+            const midLat = (minLat + maxLat) / 2;
+            // 0=NW,1=N,2=NE,3=E,4=SE,5=S,6=SW,7=W
+            const lngLats: [number, number][] = [
+              [minLng, maxLat],
+              [midLng, maxLat],
+              [maxLng, maxLat],
+              [maxLng, midLat],
+              [maxLng, minLat],
+              [midLng, minLat],
+              [minLng, minLat],
+              [minLng, midLat],
+            ];
+            const newHandles: HandleInfo[] = lngLats.map(([lng, lat]) => {
+              try {
+                const s = map.project([lng, lat]);
+                return { x: s.x, y: s.y, lng, lat };
+              } catch {
+                return { x: 0, y: 0, lng, lat };
+              }
+            });
+            setBboxHandles((prev) => {
+              if (!prev) return newHandles;
+              const changed = newHandles.some(
+                (h, i) =>
+                  Math.abs(h.x - prev[i].x) > 0.5 ||
+                  Math.abs(h.y - prev[i].y) > 0.5,
+              );
+              return changed ? newHandles : prev;
+            });
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+      rafId = requestAnimationFrame(tick);
+    }
+    rafId = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(rafId);
+      setBboxHandles(null);
+    };
+  }, [manualTool, points, dxfData]);
+
+  // ── Window event listeners for rotation wheel drag ────────────────────────
+  useEffect(() => {
+    if (manualTool !== "rotate") return;
+
+    function onMouseMove(e: MouseEvent) {
+      const drag = wheelDragRef.current;
+      if (!drag) return;
+      const dx = e.clientX - drag.startX;
+      // right = CW = negative in turf's CCW-positive convention
+      const newAngle = drag.startAngle - dx * 0.5;
+      manualDeltaRef.current = {
+        ...manualDeltaRef.current,
+        rotateDeg: newAngle,
+      };
+      const map = mapRef.current;
+      const base = baseGeoJsonRef.current;
+      if (map && base) {
+        const final = applyManualDelta(base, manualDeltaRef.current);
+        requestAnimationFrame(() => pushGeojsonRef.current(map, final));
+      }
+      setRotateTooltip({ x: e.clientX, y: e.clientY, angle: newAngle });
+    }
+
+    function onMouseUp() {
+      if (!wheelDragRef.current) return;
+      wheelDragRef.current = null;
+      setRotateTooltip(null);
+      // Commit rotation to control points
+      const pts = pointsRef.current;
+      const { pivotLng, pivotLat, rotateDeg, scaleFactor } =
+        manualDeltaRef.current;
+      if (rotateDeg !== 0 || scaleFactor !== 1) {
+        const cos = Math.cos((rotateDeg * Math.PI) / 180);
+        const sin = Math.sin((rotateDeg * Math.PI) / 180);
+        onUpdateAllMapPointsRef.current(() =>
+          pts.map((p) => {
+            let rx = p.mapLng - pivotLng;
+            let ry = p.mapLat - pivotLat;
+            if (rotateDeg !== 0) {
+              const newRx = rx * cos - ry * sin;
+              const newRy = rx * sin + ry * cos;
+              rx = newRx;
+              ry = newRy;
+            }
+            if (scaleFactor !== 1) {
+              rx *= scaleFactor;
+              ry *= scaleFactor;
+            }
+            return { ...p, mapLng: pivotLng + rx, mapLat: pivotLat + ry };
+          }),
+        );
+        manualDeltaRef.current = {
+          dlng: 0,
+          dlat: 0,
+          rotateDeg: 0,
+          scaleFactor: 1,
+          pivotLng: 0,
+          pivotLat: 0,
+        };
+      }
+    }
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [manualTool]);
+
+  // ── Window event listeners for bbox handle drag ───────────────────────────
+  useEffect(() => {
+    if (manualTool !== "scale") return;
+
+    function onMouseMove(e: MouseEvent) {
+      const drag = bboxHandleDragRef.current;
+      if (!drag) return;
+      const container = containerRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const curX = e.clientX - rect.left;
+      const curY = e.clientY - rect.top;
+      const dx = curX - drag.anchorScreenX;
+      const dy = curY - drag.anchorScreenY;
+      const currentDist = Math.sqrt(dx * dx + dy * dy) || 0.001;
+      const scaleFactor = currentDist / drag.origDist;
+      drag.currentScaleFactor = scaleFactor;
+      const scaled = turf.transformScale(
+        drag.startGeojson,
+        Math.max(0.01, scaleFactor),
+        {
+          origin: [drag.anchorLng, drag.anchorLat],
+        },
+      );
+      requestAnimationFrame(() => {
+        const map = mapRef.current;
+        if (map) pushGeojsonRef.current(map, scaled);
+      });
+    }
+
+    function onMouseUp() {
+      const drag = bboxHandleDragRef.current;
+      if (!drag) return;
+      bboxHandleDragRef.current = null;
+      const scaleFactor = drag.currentScaleFactor;
+      if (scaleFactor !== 1) {
+        const { anchorLng, anchorLat } = drag;
+        onUpdateAllMapPointsRef.current((pts) =>
+          pts.map((p) => {
+            const rx = p.mapLng - anchorLng;
+            const ry = p.mapLat - anchorLat;
+            return {
+              ...p,
+              mapLng: anchorLng + rx * scaleFactor,
+              mapLat: anchorLat + ry * scaleFactor,
+            };
+          }),
+        );
+        manualDeltaRef.current = {
+          dlng: 0,
+          dlat: 0,
+          rotateDeg: 0,
+          scaleFactor: 1,
+          pivotLng: 0,
+          pivotLat: 0,
+        };
+      }
+    }
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [manualTool]);
+
+  // ── Ghost line helpers ────────────────────────────────────────────────────
+  function createGhostSvg() {
+    const container = containerRef.current;
+    if (!container) return;
+    removeGhostSvg();
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute(
+      "style",
+      "position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:999",
+    );
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("stroke", "#FF8C00");
+    line.setAttribute("stroke-width", "1.5");
+    line.setAttribute("stroke-dasharray", "4 4");
+    line.setAttribute("opacity", "0.7");
+    svg.appendChild(line);
+    container.style.position = "relative";
+    container.appendChild(svg);
+    ghostSvgRef.current = svg;
+  }
+
+  function updateGhostLine(x1: number, y1: number, x2: number, y2: number) {
+    const svg = ghostSvgRef.current;
+    if (!svg) return;
+    const line = svg.querySelector("line");
+    if (!line) return;
+    line.setAttribute("x1", String(x1));
+    line.setAttribute("y1", String(y1));
+    line.setAttribute("x2", String(x2));
+    line.setAttribute("y2", String(y2));
+  }
+
+  function removeGhostSvg() {
+    if (ghostSvgRef.current) {
+      ghostSvgRef.current.remove();
+      ghostSvgRef.current = null;
+    }
+  }
+
+  // ── Setup overlay source+layer ────────────────────────────────────────────
+  const setupOverlayLayers = useCallback((map: MaplibreMap) => {
+    try {
+      if (map.getLayer(LAYER_ID)) map.removeLayer(LAYER_ID);
+      if (map.getSource(SOURCE_ID)) map.removeSource(SOURCE_ID);
+      map.addSource(SOURCE_ID, {
+        type: "geojson",
+        data: currentGeojsonRef.current,
+      });
+      map.addLayer({
+        id: LAYER_ID,
+        type: "line",
+        source: SOURCE_ID,
+        minzoom: 0,
+        maxzoom: 24,
+        paint: {
+          "line-color": overlayColorRef.current,
+          "line-width": overlayWidthRef.current,
+          "line-opacity": 1,
+        },
+      });
+    } catch (err) {
+      console.warn("DXF overlay setup error:", err);
+    }
+  }, []);
+  setupOverlayLayersRef.current = setupOverlayLayers;
+
+  // ── Push new GeoJSON ──────────────────────────────────────────────────────
+  const pushGeojson = useCallback(
+    (map: MaplibreMap, geojson: GeoJSONFeatureCollection) => {
+      currentGeojsonRef.current = geojson;
+      if (!map.isStyleLoaded()) return;
+      try {
+        const src = map.getSource(SOURCE_ID);
+        if (src) {
+          src.setData(geojson);
+        } else {
+          setupOverlayLayers(map);
+        }
+      } catch (err) {
+        console.warn("DXF pushGeojson error:", err);
+        try {
+          setupOverlayLayers(map);
+        } catch {
+          /* ignore */
+        }
+      }
+    },
+    [setupOverlayLayers],
+  );
+  pushGeojsonRef.current = pushGeojson;
+
+  // ── Core: recompute base GeoJSON and push ─────────────────────────────────
+  const rebuildAndPushOverlay = useCallback(
+    (pts: ControlPoint[], dxf: DxfData | null) => {
+      const map = mapRef.current;
+      if (!map) return;
+
+      if (pts.length < 3 || !dxf) {
+        baseGeoJsonRef.current = null;
+        if (pts.length === 0) {
+          manualDeltaRef.current = {
+            dlng: 0,
+            dlat: 0,
+            rotateDeg: 0,
+            scaleFactor: 1,
+            pivotLng: 0,
+            pivotLat: 0,
+          };
+          hasAutoZoomedRef.current = false;
+        }
+        pushGeojson(map, turf.featureCollection([]));
+        return;
+      }
+
+      const geojson = buildRubberSheetGeoJson(pts, dxf, lockScaleRef.current);
+      if (!geojson) return;
+
+      baseGeoJsonRef.current = geojson;
+      const delta = manualDeltaRef.current;
+      const final = applyManualDelta(geojson, delta);
+
+      pushGeojson(map, final);
+
+      if (!hasAutoZoomedRef.current && final.features.length > 0) {
+        try {
+          const bbox = turf.bbox(final);
+          if ((bbox as number[]).every(Number.isFinite)) {
+            map.fitBounds(
+              [
+                [bbox[0], bbox[1]],
+                [bbox[2], bbox[3]],
+              ],
+              { padding: 60, maxZoom: 20, duration: 800 },
+            );
+            hasAutoZoomedRef.current = true;
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    },
+    [pushGeojson], // eslint-disable-line
+  );
+
+  // ── Initialize MapLibre GL ─────────────────────────────────────────────────
+  // biome-ignore lint/correctness/useExhaustiveDependencies: ghost helpers access stable refs, init runs once
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    const map = new maplibregl.Map({
+      container: containerRef.current,
+      style: BASEMAPS[0].url,
+      center: [-74, 40],
+      zoom: 3,
+      attributionControl: false,
+    });
+
+    mapRef.current = map;
+
+    map.addControl(
+      new maplibregl.AttributionControl({ compact: true }),
+      "bottom-right",
+    );
+    map.addControl(
+      new maplibregl.NavigationControl({ showCompass: false }),
+      "bottom-right",
+    );
+
+    map.on("style.load", () => {
+      setupOverlayLayersRef.current(map);
+      map.resize();
+    });
+
+    map.on("load", () => {
+      map.resize();
+    });
+
+    setTimeout(() => map.resize(), 100);
+
+    map.on("click", (e: any) => {
+      if (pickingStateRef.current === "waiting-map") {
+        onMapClickRef.current(e.lngLat.lat, e.lngLat.lng);
+      }
+    });
+
+    map.on("mousedown", (e: any) => {
+      const tool = manualToolRef.current;
+      if (tool === "none") return;
+      if (pointsRef.current.length < 3) return;
+
+      map.dragPan.disable();
+
+      const pts = pointsRef.current;
+      const pivot = computePivot(pts);
+      const pivotLng = pivot.lng + manualDeltaRef.current.dlng;
+      const pivotLat = pivot.lat + manualDeltaRef.current.dlat;
+
+      const dx = e.lngLat.lng - pivotLng;
+      const dy = e.lngLat.lat - pivotLat;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 0.0001;
+      const angle = Math.atan2(dy, dx);
+
+      let mode: "global-move" | "point-rubber" | "rotate" | "scale" =
+        "global-move";
+      let targetPointId: number | null = null;
+      let origPointLng = 0;
+      let origPointLat = 0;
+
+      if (tool === "move") {
+        const screenPt = e.point as { x: number; y: number };
+        for (const p of pts) {
+          try {
+            const ms = map.project([p.mapLng, p.mapLat]);
+            const d = Math.sqrt(
+              (ms.x - screenPt.x) ** 2 + (ms.y - screenPt.y) ** 2,
+            );
+            if (d < 22) {
+              mode = "point-rubber";
+              targetPointId = p.id;
+              origPointLng = p.mapLng;
+              origPointLat = p.mapLat;
+              break;
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+        if (mode === "point-rubber" && targetPointId !== null) {
+          const origScreen = map.project([origPointLng, origPointLat]);
+          createGhostSvg();
+          updateGhostLine(
+            origScreen.x,
+            origScreen.y,
+            origScreen.x,
+            origScreen.y,
+          );
+        }
+      } else if (tool === "rotate") {
+        mode = "rotate";
+      } else if (tool === "scale") {
+        mode = "scale";
+      }
+
+      dragRef.current = {
+        isDragging: true,
+        mode,
+        targetPointId,
+        startLng: e.lngLat.lng,
+        startLat: e.lngLat.lat,
+        startDlng: manualDeltaRef.current.dlng,
+        startDlat: manualDeltaRef.current.dlat,
+        startRotateDeg: manualDeltaRef.current.rotateDeg,
+        startScaleFactor: manualDeltaRef.current.scaleFactor,
+        startAngle: angle,
+        startDist: dist,
+        pivotLng,
+        pivotLat,
+        origPointLng,
+        origPointLat,
+      };
+    });
+
+    map.on("mousemove", (e: any) => {
+      const tool = manualToolRef.current;
+      if (tool === "none" || !dragRef.current?.isDragging) return;
+      const drag = dragRef.current;
+      const base = baseGeoJsonRef.current;
+
+      if (drag.mode === "point-rubber" && drag.targetPointId !== null) {
+        const tmpPts = pointsRef.current.map((p) =>
+          p.id === drag.targetPointId
+            ? { ...p, mapLng: e.lngLat.lng, mapLat: e.lngLat.lat }
+            : p,
+        );
+        const dxf = dxfDataRef.current;
+        if (dxf && tmpPts.length >= 3) {
+          const geojson = buildRubberSheetGeoJson(
+            tmpPts,
+            dxf,
+            lockScaleRef.current,
+          );
+          if (geojson) {
+            requestAnimationFrame(() => pushGeojsonRef.current(map, geojson));
+          }
+        }
+        const origScreen = map.project([drag.origPointLng, drag.origPointLat]);
+        const curScreen = e.point as { x: number; y: number };
+        updateGhostLine(origScreen.x, origScreen.y, curScreen.x, curScreen.y);
+        return;
+      }
+
+      if (!base) return;
+
+      const delta = { ...manualDeltaRef.current };
+
+      if (drag.mode === "global-move") {
+        delta.dlng = drag.startDlng + (e.lngLat.lng - drag.startLng);
+        delta.dlat = drag.startDlat + (e.lngLat.lat - drag.startLat);
+      } else if (drag.mode === "rotate") {
+        const rdx = e.lngLat.lng - drag.pivotLng;
+        const rdy = e.lngLat.lat - drag.pivotLat;
+        const currentAngle = Math.atan2(rdy, rdx);
+        const deltaAngle = ((currentAngle - drag.startAngle) * 180) / Math.PI;
+        delta.rotateDeg = drag.startRotateDeg + deltaAngle;
+        delta.pivotLng = drag.pivotLng;
+        delta.pivotLat = drag.pivotLat;
+      } else if (drag.mode === "scale") {
+        const sdx = e.lngLat.lng - drag.pivotLng;
+        const sdy = e.lngLat.lat - drag.pivotLat;
+        const currentDist = Math.sqrt(sdx * sdx + sdy * sdy) || 0.0001;
+        const scaleFactor =
+          drag.startScaleFactor * (currentDist / drag.startDist);
+        delta.scaleFactor = Math.max(0.01, scaleFactor);
+        delta.pivotLng = drag.pivotLng;
+        delta.pivotLat = drag.pivotLat;
+      }
+
+      manualDeltaRef.current = delta;
+      const final = applyManualDelta(base, delta);
+      requestAnimationFrame(() => pushGeojsonRef.current(map, final));
+    });
+
+    map.on("mouseup", () => {
+      const drag = dragRef.current;
+      if (!drag) return;
+
+      if (
+        drag.isDragging &&
+        drag.mode === "point-rubber" &&
+        drag.targetPointId !== null
+      ) {
+        removeGhostSvg();
+      }
+
+      dragRef.current = null;
+
+      if (manualToolRef.current !== "none") {
+        map.dragPan.enable();
+
+        if (drag.mode === "global-move") {
+          const delta = manualDeltaRef.current;
+          if (delta.dlng !== 0 || delta.dlat !== 0) {
+            onUpdateAllMapPointsRef.current((prev) =>
+              prev.map((p) => ({
+                ...p,
+                mapLng: p.mapLng + delta.dlng,
+                mapLat: p.mapLat + delta.dlat,
+              })),
+            );
+            manualDeltaRef.current = {
+              ...manualDeltaRef.current,
+              dlng: 0,
+              dlat: 0,
+            };
+          }
+        } else if (drag.mode === "rotate" || drag.mode === "scale") {
+          const pts = pointsRef.current;
+          const { pivotLng, pivotLat, rotateDeg, scaleFactor } =
+            manualDeltaRef.current;
+
+          if (rotateDeg !== 0 || scaleFactor !== 1) {
+            const cos = Math.cos((rotateDeg * Math.PI) / 180);
+            const sin = Math.sin((rotateDeg * Math.PI) / 180);
+
+            onUpdateAllMapPointsRef.current(() =>
+              pts.map((p) => {
+                let rx = p.mapLng - pivotLng;
+                let ry = p.mapLat - pivotLat;
+                if (rotateDeg !== 0) {
+                  const newRx = rx * cos - ry * sin;
+                  const newRy = rx * sin + ry * cos;
+                  rx = newRx;
+                  ry = newRy;
+                }
+                if (scaleFactor !== 1) {
+                  rx *= scaleFactor;
+                  ry *= scaleFactor;
+                }
+                return { ...p, mapLng: pivotLng + rx, mapLat: pivotLat + ry };
+              }),
+            );
+
+            manualDeltaRef.current = {
+              dlng: 0,
+              dlat: 0,
+              rotateDeg: 0,
+              scaleFactor: 1,
+              pivotLng: 0,
+              pivotLat: 0,
+            };
+          }
+        }
+      }
+    });
+
+    return () => {
+      for (const m of markersRef.current) m.remove();
+      markersRef.current = [];
+      removeGhostSvg();
+      map.remove();
+      mapRef.current = null;
+    };
+  }, []); // eslint-disable-line
+
+  // ── Cursor style ─────────────────────────────────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const canvas = map.getCanvas();
+    if (pickingState === "waiting-map") {
+      canvas.style.cursor = "crosshair";
+    } else if (manualTool === "move") {
+      canvas.style.cursor = "move";
+    } else if (manualTool === "rotate" || manualTool === "scale") {
+      canvas.style.cursor = "grab";
+    } else {
+      canvas.style.cursor = "";
+    }
+  }, [pickingState, manualTool]);
+
+  // ── DXF Overlay ────────────────────────────────────────────────────────────
+  useEffect(() => {
+    rebuildAndPushOverlay(points, dxfData);
+  }, [points, dxfData, rebuildAndPushOverlay]);
+
+  // ── Numbered SVG markers with rubber-sheeting + ghost line ────────────────
+  // biome-ignore lint/correctness/useExhaustiveDependencies: ghost helpers use stable refs
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    for (const m of markersRef.current) m.remove();
+    markersRef.current = [];
+
+    for (const p of points) {
+      const el = document.createElement("div");
+      el.innerHTML = `<svg width="30" height="30" viewBox="0 0 30 30" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="15" cy="15" r="12" fill="${MARKER_COLOR}" stroke="white" stroke-width="2.5"/>
+        <text x="15" y="19" text-anchor="middle" font-size="11" font-weight="bold" font-family="monospace" fill="${MARKER_TEXT_COLOR}">${p.id}</text>
+      </svg>`;
+      el.style.cursor = "grab";
+      el.style.width = "30px";
+      el.style.height = "30px";
+      el.setAttribute("data-ocid", "map.map_marker");
+
+      const marker = new maplibregl.Marker({ element: el, draggable: true })
+        .setLngLat([p.mapLng, p.mapLat])
+        .addTo(map);
+
+      let origLng = p.mapLng;
+      let origLat = p.mapLat;
+      let origScreen = { x: 0, y: 0 };
+
+      marker.on("dragstart", () => {
+        el.style.cursor = "grabbing";
+        const lngLat = marker.getLngLat();
+        origLng = lngLat.lng;
+        origLat = lngLat.lat;
+        try {
+          origScreen = map.project([origLng, origLat]);
+        } catch {
+          origScreen = { x: 0, y: 0 };
+        }
+        createGhostSvg();
+        updateGhostLine(origScreen.x, origScreen.y, origScreen.x, origScreen.y);
+      });
+
+      marker.on("drag", () => {
+        const lngLat = marker.getLngLat();
+        const tmpPts = pointsRef.current.map((pt) =>
+          pt.id === p.id
+            ? { ...pt, mapLng: lngLat.lng, mapLat: lngLat.lat }
+            : pt,
+        );
+        const dxf = dxfDataRef.current;
+        if (dxf && tmpPts.length >= 3) {
+          const geojson = buildRubberSheetGeoJson(
+            tmpPts,
+            dxf,
+            lockScaleRef.current,
+          );
+          if (geojson) pushGeojsonRef.current(map, geojson);
+        }
+        try {
+          const curScreen = map.project([lngLat.lng, lngLat.lat]);
+          updateGhostLine(origScreen.x, origScreen.y, curScreen.x, curScreen.y);
+        } catch {
+          /* ignore */
+        }
+      });
+
+      marker.on("dragend", () => {
+        el.style.cursor = "grab";
+        removeGhostSvg();
+        const lngLat = marker.getLngLat();
+        onUpdateMapPointRef.current(p.id, lngLat.lat, lngLat.lng);
+        const updatedPts = pointsRef.current.map((pt) =>
+          pt.id === p.id
+            ? { ...pt, mapLng: lngLat.lng, mapLat: lngLat.lat }
+            : pt,
+        );
+        const newPivot = computePivot(updatedPts);
+        manualDeltaRef.current = {
+          ...manualDeltaRef.current,
+          pivotLng: newPivot.lng,
+          pivotLat: newPivot.lat,
+        };
+      });
+
+      markersRef.current.push(marker);
+    }
+  }, [points]); // eslint-disable-line
+
+  // ── Basemap change ────────────────────────────────────────────────────────
+  const handleBasemapChange = useCallback((basemapId: string) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const bm = BASEMAPS.find((b) => b.id === basemapId);
+    if (!bm) return;
+    setActiveBasemap(basemapId);
+    map.setStyle(bm.url);
+  }, []);
+
+  const hasOverlay = points.length >= 3 && dxfData !== null;
+
+  // ── Rotation wheel indicator line angle (screen space) ───────────────────
+  const wheelIndicatorRad = (-manualDeltaRef.current.rotateDeg * Math.PI) / 180;
+
+  return (
+    <div
+      className="relative w-full h-full"
+      style={{ minHeight: 600 }}
+      data-ocid="map.canvas_target"
+    >
+      <div
+        ref={containerRef}
+        style={{ width: "100%", height: "100%", minHeight: 600 }}
+      />
+
+      {pickingState === "waiting-map" && (
+        <div
+          className="absolute top-3 left-1/2 -translate-x-1/2 z-[1000] text-xs font-mono px-3 py-1.5 rounded-sm pointer-events-none"
+          style={{ background: "rgba(255,200,0,0.9)", color: "#0d1b2a" }}
+        >
+          Click on the map to place corresponding point
+        </div>
+      )}
+
+      {/* ── Toolbar ─────────────────────────────────────────────────────── */}
+      {hasOverlay && (
+        <div
+          data-ocid="map.toolbar.panel"
+          className="absolute top-3 left-3 flex flex-col gap-1 p-1 rounded-md z-[1000]"
+          style={{
+            background: "rgba(13,27,42,0.88)",
+            border: "1px solid rgba(255,140,0,0.25)",
+            backdropFilter: "blur(6px)",
+          }}
+        >
+          <MapToolButton
+            ocid="map.move_tool.button"
+            label="Move / Rubber-Sheet"
+            active={manualTool === "move"}
+            onClick={() =>
+              setManualTool((t) => (t === "move" ? "none" : "move"))
+            }
+          >
+            <Move size={14} />
+          </MapToolButton>
+          <MapToolButton
+            ocid="map.rotate_tool.button"
+            label="Rotate Overlay"
+            active={manualTool === "rotate"}
+            onClick={() =>
+              setManualTool((t) => (t === "rotate" ? "none" : "rotate"))
+            }
+          >
+            <RotateCw size={14} />
+          </MapToolButton>
+          <MapToolButton
+            ocid="map.scale_tool.button"
+            label="Scale Overlay"
+            active={manualTool === "scale"}
+            onClick={() =>
+              setManualTool((t) => (t === "scale" ? "none" : "scale"))
+            }
+          >
+            <Maximize2 size={14} />
+          </MapToolButton>
+
+          {/* ── Separator ─────────────────────────────────────── */}
+          <div
+            style={{
+              height: 1,
+              background: "rgba(255,140,0,0.2)",
+              margin: "2px 0",
+            }}
+          />
+
+          {/* ── Lock Scale Toggle ──────────────────────────────── */}
+          <button
+            type="button"
+            data-ocid="map.lock_scale.toggle"
+            title={
+              lockScale
+                ? "Lock Scale ON — uniform scaling (click to disable rubber-sheet lock)"
+                : "Lock Scale OFF — rubber-sheet/warp enabled (click to lock)"
+            }
+            onClick={() => setLockScale((v) => !v)}
+            className="w-7 h-7 flex items-center justify-center rounded-sm transition-colors duration-150"
+            style={{
+              background: lockScale ? MARKER_COLOR : "transparent",
+              color: lockScale ? MARKER_TEXT_COLOR : "rgba(255,140,0,0.5)",
+              border: lockScale ? "none" : "1px dashed rgba(255,140,0,0.4)",
+            }}
+          >
+            {lockScale ? <Lock size={12} /> : <Unlock size={12} />}
+          </button>
+        </div>
+      )}
+
+      {/* ── Rotation Wheel SVG ─────────────────────────────────────────── */}
+      {manualTool === "rotate" && pivotScreen && hasOverlay && (
+        <svg
+          role="img"
+          aria-label="Rotation wheel overlay"
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            width: "100%",
+            height: "100%",
+            pointerEvents: "none",
+            zIndex: 1001,
+          }}
+        >
+          {/* Background halo */}
+          <circle
+            cx={pivotScreen.x}
+            cy={pivotScreen.y}
+            r={84}
+            fill="rgba(13,27,42,0.35)"
+            stroke="rgba(255,140,0,0.2)"
+            strokeWidth={1}
+          />
+
+          {/* Tick marks */}
+          {Array.from({ length: 36 }, (_, i) => i * 10).map((deg) => {
+            const rad = (deg * Math.PI) / 180;
+            const isMajor = deg % 30 === 0;
+            const r1 = isMajor ? 70 : 74;
+            const r2 = 82;
+            return (
+              <line
+                key={deg}
+                x1={pivotScreen.x + r1 * Math.cos(rad)}
+                y1={pivotScreen.y + r1 * Math.sin(rad)}
+                x2={pivotScreen.x + r2 * Math.cos(rad)}
+                y2={pivotScreen.y + r2 * Math.sin(rad)}
+                stroke={
+                  isMajor ? "rgba(255,140,0,0.7)" : "rgba(255,140,0,0.35)"
+                }
+                strokeWidth={isMajor ? 1.5 : 0.8}
+              />
+            );
+          })}
+
+          {/* Degree labels at cardinal points */}
+          {[0, 90, 180, 270].map((deg) => {
+            const rad = (deg * Math.PI) / 180;
+            const r = 94;
+            return (
+              <text
+                key={deg}
+                x={pivotScreen.x + r * Math.cos(rad)}
+                y={pivotScreen.y + r * Math.sin(rad)}
+                fill="rgba(255,140,0,0.75)"
+                fontSize={9}
+                textAnchor="middle"
+                dominantBaseline="middle"
+                fontFamily="monospace"
+              >
+                {deg}°
+              </text>
+            );
+          })}
+
+          {/* Current angle indicator line */}
+          <line
+            x1={pivotScreen.x}
+            y1={pivotScreen.y}
+            x2={pivotScreen.x + 78 * Math.cos(wheelIndicatorRad)}
+            y2={pivotScreen.y + 78 * Math.sin(wheelIndicatorRad)}
+            stroke="rgba(255,200,0,0.9)"
+            strokeWidth={2}
+            strokeLinecap="round"
+          />
+
+          {/* Pivot dot */}
+          <circle
+            cx={pivotScreen.x}
+            cy={pivotScreen.y}
+            r={5}
+            fill="#FFD700"
+            stroke="white"
+            strokeWidth={1.5}
+          />
+
+          {/* Draggable ring (pointer-events: all) */}
+          <circle
+            cx={pivotScreen.x}
+            cy={pivotScreen.y}
+            r={80}
+            fill="transparent"
+            stroke="transparent"
+            strokeWidth={20}
+            style={{ pointerEvents: "all", cursor: "ew-resize" }}
+            onMouseDown={(e) => {
+              e.stopPropagation();
+              wheelDragRef.current = {
+                startX: e.clientX,
+                startAngle: manualDeltaRef.current.rotateDeg,
+              };
+            }}
+          />
+        </svg>
+      )}
+
+      {/* ── Scale Bounding Box SVG ─────────────────────────────────────── */}
+      {manualTool === "scale" &&
+        bboxHandles &&
+        bboxHandles.length === 8 &&
+        hasOverlay && (
+          <svg
+            role="img"
+            aria-label="Scale bounding box overlay"
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              width: "100%",
+              height: "100%",
+              pointerEvents: "none",
+              zIndex: 1001,
+            }}
+          >
+            {/* Bounding box outline — corners 0(NW),2(NE),4(SE),6(SW) */}
+            <polygon
+              points={[0, 2, 4, 6]
+                .map((i) => `${bboxHandles[i].x},${bboxHandles[i].y}`)
+                .join(" ")}
+              fill="none"
+              stroke="#FF8C00"
+              strokeWidth={1.5}
+              strokeDasharray="6 3"
+              opacity={0.85}
+            />
+
+            {/* 8 draggable handles */}
+            {bboxHandles.map((h, i) => {
+              const handleName = ["NW", "N", "NE", "E", "SE", "S", "SW", "W"][
+                i
+              ];
+              return (
+                <rect
+                  key={handleName}
+                  x={h.x - 5}
+                  y={h.y - 5}
+                  width={10}
+                  height={10}
+                  fill="#FF8C00"
+                  stroke="white"
+                  strokeWidth={1.5}
+                  rx={1}
+                  style={{ pointerEvents: "all", cursor: "pointer" }}
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    const container = containerRef.current;
+                    if (!container) return;
+                    const rect = container.getBoundingClientRect();
+                    const startX = e.clientX - rect.left;
+                    const startY = e.clientY - rect.top;
+                    const anchorIdx = (i + 4) % 8;
+                    const anchor = bboxHandles[anchorIdx];
+                    const ddx = startX - anchor.x;
+                    const ddy = startY - anchor.y;
+                    const origDist = Math.sqrt(ddx * ddx + ddy * ddy) || 0.001;
+                    bboxHandleDragRef.current = {
+                      handleIndex: i,
+                      anchorLng: anchor.lng,
+                      anchorLat: anchor.lat,
+                      anchorScreenX: anchor.x,
+                      anchorScreenY: anchor.y,
+                      origDist,
+                      currentScaleFactor: 1,
+                      startGeojson: currentGeojsonRef.current,
+                    };
+                  }}
+                />
+              );
+            })}
+          </svg>
+        )}
+
+      {/* ── Rotate angle tooltip ────────────────────────────────────────── */}
+      {rotateTooltip && (
+        <div
+          style={{
+            position: "fixed",
+            left: rotateTooltip.x + 16,
+            top: rotateTooltip.y - 22,
+            background: "rgba(13,27,42,0.92)",
+            border: "1px solid rgba(255,140,0,0.6)",
+            color: "#FF8C00",
+            fontFamily: "monospace",
+            fontSize: 11,
+            fontWeight: "bold",
+            padding: "2px 8px",
+            borderRadius: 4,
+            pointerEvents: "none",
+            zIndex: 9999,
+            whiteSpace: "nowrap",
+          }}
+        >
+          {rotateTooltip.angle.toFixed(1)}°
+        </div>
+      )}
+
+      {/* ── Overlay Style Panel ─────────────────────────────────────────── */}
+      <div className="absolute z-[1000]" style={{ bottom: 52, left: 12 }}>
+        <button
+          type="button"
+          data-ocid="map.overlay_style.toggle"
+          title="Overlay Style"
+          onClick={() => setShowStylePanel((v) => !v)}
+          style={{
+            background: showStylePanel ? MARKER_COLOR : "rgba(13,27,42,0.88)",
+            border: "1px solid rgba(255,140,0,0.35)",
+            borderRadius: 6,
+            width: 30,
+            height: 30,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "pointer",
+            color: showStylePanel ? MARKER_TEXT_COLOR : "rgba(255,140,0,0.85)",
+            backdropFilter: "blur(6px)",
+          }}
+        >
+          <Palette size={14} />
+        </button>
+
+        {showStylePanel && (
+          <div
+            data-ocid="map.overlay_style.panel"
+            style={{
+              position: "absolute",
+              bottom: 36,
+              left: 0,
+              background: "rgba(13,27,42,0.96)",
+              border: "1px solid rgba(255,140,0,0.25)",
+              borderRadius: 8,
+              padding: 12,
+              width: 216,
+              backdropFilter: "blur(8px)",
+              boxShadow: "0 4px 24px rgba(0,0,0,0.6)",
+            }}
+          >
+            <div
+              style={{
+                fontSize: 10,
+                fontFamily: "monospace",
+                color: "rgba(255,140,0,0.6)",
+                letterSpacing: "0.1em",
+                textTransform: "uppercase",
+                marginBottom: 8,
+              }}
+            >
+              Overlay Style
+            </div>
+
+            <HsvColorPicker color={overlayColor} onChange={setOverlayColor} />
+
+            <div style={{ marginTop: 10 }}>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  marginBottom: 4,
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontFamily: "monospace",
+                    color: "rgba(255,140,0,0.7)",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.08em",
+                  }}
+                >
+                  Thickness
+                </span>
+                <span
+                  style={{
+                    fontSize: 11,
+                    fontFamily: "monospace",
+                    color: "rgba(255,140,0,0.9)",
+                    fontWeight: "bold",
+                  }}
+                >
+                  {overlayWidth}px
+                </span>
+              </div>
+              <input
+                type="range"
+                min={1}
+                max={5}
+                step={0.5}
+                value={overlayWidth}
+                onChange={(e) => setOverlayWidth(Number(e.target.value))}
+                data-ocid="map.overlay_width.input"
+                style={{
+                  width: "100%",
+                  accentColor: MARKER_COLOR,
+                  cursor: "pointer",
+                }}
+              />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── Basemap selector ────────────────────────────────────────────── */}
+      <div
+        data-ocid="map.basemap.panel"
+        className="absolute bottom-10 right-3 z-[1000] flex gap-1"
+      >
+        {BASEMAPS.map((bm) => (
+          <button
+            key={bm.id}
+            type="button"
+            data-ocid="map.basemap.button"
+            onClick={() => handleBasemapChange(bm.id)}
+            className="text-[10px] font-mono px-2 py-1 rounded-sm transition-colors"
+            style={{
+              background:
+                activeBasemap === bm.id ? MARKER_COLOR : "rgba(13,27,42,0.88)",
+              color:
+                activeBasemap === bm.id ? "#1a0a00" : "rgba(255,140,0,0.8)",
+              border: "1px solid rgba(255,140,0,0.25)",
+              backdropFilter: "blur(4px)",
+            }}
+          >
+            {bm.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MapToolButton({
+  ocid,
+  label,
+  active,
+  onClick,
+  children,
+}: {
+  ocid: string;
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      data-ocid={ocid}
+      title={label}
+      onClick={onClick}
+      className="w-7 h-7 flex items-center justify-center rounded-sm transition-colors duration-150"
+      style={{
+        background: active ? MARKER_COLOR : "transparent",
+        color: active ? MARKER_TEXT_COLOR : "rgba(255,140,0,0.7)",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
