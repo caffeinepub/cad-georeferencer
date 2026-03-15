@@ -191,6 +191,7 @@ export default function App() {
                     onMapClick={onMapClick}
                     onUpdateMapPoint={updateMapPoint}
                     onUpdateAllMapPoints={onUpdateAllMapPoints}
+                    onClearAll={clearAll}
                   />
                 </div>
               </div>

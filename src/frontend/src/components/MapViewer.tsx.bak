@@ -587,14 +587,6 @@ export function MapViewer({
   // Drag refs
   const bboxHandleDragRef = useRef<BboxHandleDrag | null>(null);
 
-  // Hold-rotate refs
-  const rotHoldIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
-    null,
-  );
-  const rotHoldAccumRef = useRef(0);
-  const rotHoldPivotRef = useRef<{ lng: number; lat: number } | null>(null);
-  const rotHoldBaseGeojsonRef = useRef<GeoJSONFeatureCollection | null>(null);
-
   // CTRL+pivot drag refs
   const ctrlPivotDragRef = useRef(false);
   const userPivotOverrideRef = useRef<{ lng: number; lat: number } | null>(
@@ -817,10 +809,6 @@ export function MapViewer({
     if (manualTool !== "rotate") {
       setDisplayRotDeg(0);
       userPivotOverrideRef.current = null;
-      if (rotHoldIntervalRef.current !== null) {
-        clearInterval(rotHoldIntervalRef.current);
-        rotHoldIntervalRef.current = null;
-      }
       return;
     }
 
@@ -1587,20 +1575,7 @@ export function MapViewer({
   }, [manualTool]);
 
   // ── Rotate step (widget +/- buttons) ────────────────────────────────────────
-  const applyRotationPreview = (totalAccumDeg: number) => {
-    const base = rotHoldBaseGeojsonRef.current;
-    const pivot = rotHoldPivotRef.current;
-    const map = mapRef.current;
-    if (!base || !pivot || !map) return;
-    // turf.transformRotate: negative = clockwise (matches screen coords)
-    const rotated = turf.transformRotate(base, -totalAccumDeg, {
-      pivot: [pivot.lng, pivot.lat],
-    });
-    pushGeojsonRef.current(map, rotated as GeoJSONFeatureCollection);
-    setDisplayRotDeg(totalAccumDeg);
-  };
-
-  const startHoldRotate = (dir: 1 | -1) => {
+  const handleRotateStep = (delta: number) => {
     const pts = pointsRef.current;
     if (pts.length < 3) return;
 
@@ -1614,38 +1589,12 @@ export function MapViewer({
       pivotLng = pivot.lng;
       pivotLat = pivot.lat;
     }
-    rotHoldPivotRef.current = { lng: pivotLng, lat: pivotLat };
-    rotHoldBaseGeojsonRef.current = JSON.parse(
-      JSON.stringify(currentGeojsonRef.current),
-    ) as GeoJSONFeatureCollection;
-    rotHoldAccumRef.current = 0;
 
-    // Apply first step immediately
-    rotHoldAccumRef.current += dir;
-    applyRotationPreview(rotHoldAccumRef.current);
-
-    if (rotHoldIntervalRef.current !== null) {
-      clearInterval(rotHoldIntervalRef.current);
-    }
-    rotHoldIntervalRef.current = setInterval(() => {
-      rotHoldAccumRef.current += dir;
-      applyRotationPreview(rotHoldAccumRef.current);
-    }, 100);
-  };
-
-  const stopHoldRotate = () => {
-    if (rotHoldIntervalRef.current !== null) {
-      clearInterval(rotHoldIntervalRef.current);
-      rotHoldIntervalRef.current = null;
-    }
-    const accum = rotHoldAccumRef.current;
-    const pivot = rotHoldPivotRef.current;
-    if (accum === 0 || !pivot) return;
-
-    const rad = (accum * Math.PI) / 180;
+    // +delta = clockwise in geographic coords (Y increases northward)
+    // CW rotation: x' = cos*x + sin*y, y' = -sin*x + cos*y
+    const rad = (delta * Math.PI) / 180;
     const cos = Math.cos(rad);
     const sin = Math.sin(rad);
-    const { lng: pivotLng, lat: pivotLat } = pivot;
 
     onUpdateAllMapPointsRef.current((prev) =>
       prev.map((p) => {
@@ -1659,9 +1608,7 @@ export function MapViewer({
       }),
     );
 
-    rotHoldAccumRef.current = 0;
-    rotHoldBaseGeojsonRef.current = null;
-    setDisplayRotDeg(0);
+    setDisplayRotDeg((prev) => prev + delta);
   };
 
   // ── Revert to Original ────────────────────────────────────────────────────
@@ -1924,12 +1871,7 @@ export function MapViewer({
           <button
             type="button"
             data-ocid="map.rotate_minus.button"
-            onMouseDown={(e) => {
-              e.preventDefault();
-              startHoldRotate(-1);
-            }}
-            onMouseUp={stopHoldRotate}
-            onMouseLeave={stopHoldRotate}
+            onClick={() => handleRotateStep(-1)}
             title="Rotate 1° counter-clockwise"
             style={{
               width: 36,
@@ -1973,12 +1915,7 @@ export function MapViewer({
           <button
             type="button"
             data-ocid="map.rotate_plus.button"
-            onMouseDown={(e) => {
-              e.preventDefault();
-              startHoldRotate(1);
-            }}
-            onMouseUp={stopHoldRotate}
-            onMouseLeave={stopHoldRotate}
+            onClick={() => handleRotateStep(1)}
             title="Rotate 1° clockwise"
             style={{
               width: 36,

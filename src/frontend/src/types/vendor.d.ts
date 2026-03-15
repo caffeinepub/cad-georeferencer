@@ -37,6 +37,7 @@ interface MaplibreMap {
   ): void;
   dragPan: { enable(): void; disable(): void };
   project(lngLat: [number, number]): { x: number; y: number };
+  unproject(point: [number, number]): { lng: number; lat: number };
   setPaintProperty(layerId: string, name: string, value: any): void;
 }
 
@@ -50,6 +51,7 @@ interface MaplibreMarker {
   remove(): void;
   getLngLat(): { lat: number; lng: number };
   on(event: string, handler: () => void): void;
+  setDraggable(draggable: boolean): this;
 }
 
 declare const turf: {

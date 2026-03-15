@@ -1,7 +1,7 @@
 import { Expand, Hand, MapPin, Maximize2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PickingState } from "../hooks/useControlPoints";
-import type { DxfData } from "../utils/dxfRenderer";
+import type { DxfData, DxfEntity } from "../utils/dxfRenderer";
 import { renderDxf, renderGrid } from "../utils/dxfRenderer";
 import type { ControlPoint } from "../utils/wld3";
 
@@ -34,6 +34,48 @@ function fitBounds(
   const tx = canvasW / 2 - cx * scale;
   const ty = canvasH / 2 + cy * scale;
   return { tx, ty, scale };
+}
+
+// ── DXF vertex extraction for snapping ──────────────────────────────────────
+function extractDxfVertices(entities: DxfEntity[]): { x: number; y: number }[] {
+  const verts: { x: number; y: number }[] = [];
+  for (const entity of entities) {
+    const e = entity as any;
+    switch (entity.type) {
+      case "LINE": {
+        const x1 = e.vertices?.[0]?.x ?? e.start?.x ?? 0;
+        const y1 = e.vertices?.[0]?.y ?? e.start?.y ?? 0;
+        const x2 = e.vertices?.[1]?.x ?? e.end?.x ?? 0;
+        const y2 = e.vertices?.[1]?.y ?? e.end?.y ?? 0;
+        verts.push({ x: x1, y: y1 }, { x: x2, y: y2 });
+        break;
+      }
+      case "LWPOLYLINE":
+      case "POLYLINE": {
+        const polyVerts = e.vertices || [];
+        for (const v of polyVerts) verts.push({ x: v.x ?? 0, y: v.y ?? 0 });
+        break;
+      }
+      case "CIRCLE": {
+        verts.push({ x: e.center?.x ?? 0, y: e.center?.y ?? 0 });
+        break;
+      }
+      case "ARC": {
+        const cx = e.center?.x ?? 0;
+        const cy = e.center?.y ?? 0;
+        const r = e.radius ?? 1;
+        const startRad = ((e.startAngle ?? 0) * Math.PI) / 180;
+        const endRad = ((e.endAngle ?? 360) * Math.PI) / 180;
+        verts.push(
+          { x: cx, y: cy },
+          { x: cx + r * Math.cos(startRad), y: cy + r * Math.sin(startRad) },
+          { x: cx + r * Math.cos(endRad), y: cy + r * Math.sin(endRad) },
+        );
+        break;
+      }
+    }
+  }
+  return verts;
 }
 
 interface CadViewerProps {
@@ -88,6 +130,9 @@ export function CadViewer({
   } | null>(null);
 
   const animFrameRef = useRef<number | null>(null);
+
+  // ── Snap vertex ref: stores world coord of nearest snap vertex ────────────
+  const snapVertexRef = useRef<{ x: number; y: number } | null>(null);
 
   const setActiveTool_ = useCallback((tool: ActiveTool) => {
     setActiveTool(tool);
@@ -188,6 +233,38 @@ export function CadViewer({
         const pos = toCanvas(pin.cadX, pin.cadY);
         drawPin(ctx, pos.x, pos.y, pin.id === -1 ? "?" : String(pin.id));
       }
+
+      // ── Draw snap indicator ────────────────────────────────────────────
+      const snapVertex = snapVertexRef.current;
+      if (
+        activeTool === "add-points" &&
+        pickingState === "waiting-cad" &&
+        snapVertex
+      ) {
+        const sPos = toCanvas(snapVertex.x, snapVertex.y);
+        const ARM = 8;
+        ctx.save();
+        ctx.strokeStyle = "#00d4ff";
+        ctx.lineWidth = 1.5;
+        ctx.lineCap = "round";
+        // Horizontal arm
+        ctx.beginPath();
+        ctx.moveTo(sPos.x - ARM, sPos.y);
+        ctx.lineTo(sPos.x + ARM, sPos.y);
+        ctx.stroke();
+        // Vertical arm
+        ctx.beginPath();
+        ctx.moveTo(sPos.x, sPos.y - ARM);
+        ctx.lineTo(sPos.x, sPos.y + ARM);
+        ctx.stroke();
+        // Circle
+        ctx.beginPath();
+        ctx.arc(sPos.x, sPos.y, 4, 0, Math.PI * 2);
+        ctx.strokeStyle = "rgba(0,212,255,0.7)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.restore();
+      }
     } else if (parseError) {
       ctx.save();
       ctx.font = "14px JetBrains Mono";
@@ -200,7 +277,16 @@ export function CadViewer({
       );
       ctx.restore();
     }
-  }, [dxf, parseError, points, pendingCadCoord, toCanvas, renderTick]);
+  }, [
+    dxf,
+    parseError,
+    points,
+    pendingCadCoord,
+    toCanvas,
+    renderTick,
+    activeTool,
+    pickingState,
+  ]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -297,9 +383,53 @@ export function CadViewer({
           width: Math.abs(curX - sx),
           height: Math.abs(curY - sy),
         });
+        return;
+      }
+
+      // ── Snap vertex detection when adding points ──────────────────────────
+      if (
+        activeTool === "add-points" &&
+        pickingState === "waiting-cad" &&
+        dxf
+      ) {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const rect = canvas.getBoundingClientRect();
+        const cx = e.clientX - rect.left;
+        const cy = e.clientY - rect.top;
+
+        const vertices = extractDxfVertices(dxf.entities);
+        let nearestDist = 12; // 12px threshold
+        let nearestWorld: { x: number; y: number } | null = null;
+
+        for (const v of vertices) {
+          const screen = toCanvas(v.x, v.y);
+          const dist = Math.sqrt((screen.x - cx) ** 2 + (screen.y - cy) ** 2);
+          if (dist < nearestDist) {
+            nearestDist = dist;
+            nearestWorld = v;
+          }
+        }
+
+        const prev = snapVertexRef.current;
+        if (nearestWorld !== prev) {
+          // Check if actually changed
+          if (
+            !nearestWorld ||
+            !prev ||
+            nearestWorld.x !== prev.x ||
+            nearestWorld.y !== prev.y
+          ) {
+            snapVertexRef.current = nearestWorld;
+            bumpRender();
+          }
+        }
+      } else if (snapVertexRef.current !== null) {
+        snapVertexRef.current = null;
+        bumpRender();
       }
     },
-    [activeTool, bumpRender],
+    [activeTool, pickingState, dxf, bumpRender, toCanvas],
   );
 
   const handleMouseUp = useCallback(
@@ -358,7 +488,12 @@ export function CadViewer({
       zoomBoxStart.current = null;
       setZoomBoxRect(null);
     }
-  }, []);
+    // Clear snap when mouse leaves
+    if (snapVertexRef.current !== null) {
+      snapVertexRef.current = null;
+      bumpRender();
+    }
+  }, [bumpRender]);
 
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
@@ -369,8 +504,15 @@ export function CadViewer({
       const rect = canvas.getBoundingClientRect();
       const cx = e.clientX - rect.left;
       const cy = e.clientY - rect.top;
-      const world = toWorld(cx, cy);
-      onCadClick(world.x, world.y);
+
+      // Use snap vertex if available, otherwise raw world click
+      if (snapVertexRef.current) {
+        const sv = snapVertexRef.current;
+        onCadClick(sv.x, sv.y);
+      } else {
+        const world = toWorld(cx, cy);
+        onCadClick(world.x, world.y);
+      }
     },
     [activeTool, pickingState, toWorld, onCadClick],
   );
@@ -378,7 +520,8 @@ export function CadViewer({
   const getCursor = () => {
     if (activeTool === "pan") return isDragging.current ? "grabbing" : "grab";
     if (activeTool === "zoom-box") return "crosshair";
-    if (activeTool === "add-points") return "crosshair";
+    if (activeTool === "add-points")
+      return snapVertexRef.current ? "cell" : "crosshair";
     return "default";
   };
 
@@ -481,7 +624,9 @@ export function CadViewer({
           className="absolute top-3 left-1/2 -translate-x-1/2 text-xs font-mono px-3 py-1.5 rounded-sm pointer-events-none"
           style={{ background: "rgba(0,212,255,0.9)", color: "#0d1b2a" }}
         >
-          Click CAD drawing to place point
+          {snapVertexRef.current
+            ? "Snap to vertex"
+            : "Click CAD drawing to place point"}
         </div>
       )}
       {activeTool === "add-points" && pickingState === "waiting-map" && (
