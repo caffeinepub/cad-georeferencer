@@ -32,6 +32,7 @@ export default function App() {
     updateMapPoint,
     onUpdateAllMapPoints,
     deletePoint,
+    undoLastPoint,
     clearAll,
   } = useControlPoints();
 
@@ -172,6 +173,8 @@ export default function App() {
                     isAddMode={isAddMode}
                     onStartAddMode={startAddMode}
                     onStopAddMode={stopAddMode}
+                    onUndoLastPoint={undoLastPoint}
+                    onDeletePoint={deletePoint}
                   />
                 </div>
               </div>

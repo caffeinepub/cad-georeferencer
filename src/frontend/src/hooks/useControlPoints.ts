@@ -21,6 +21,7 @@ export interface UseControlPointsReturn {
     updater: (pts: ControlPoint[]) => ControlPoint[],
   ) => void;
   deletePoint: (id: number) => void;
+  undoLastPoint: () => void;
   clearAll: () => void;
 }
 
@@ -106,6 +107,16 @@ export function useControlPoints(): UseControlPointsReturn {
     setPoints((prev) => prev.filter((p) => p.id !== id));
   }, []);
 
+  const undoLastPoint = useCallback(() => {
+    setPoints((prev) => {
+      if (prev.length === 0) return prev;
+      return prev.slice(0, -1);
+    });
+    // Cancel any pending pick state
+    setPendingCadCoord(null);
+    setPickingState((ps) => (ps === "waiting-map" ? "waiting-cad" : ps));
+  }, []);
+
   const clearAll = useCallback(() => {
     setPoints([]);
     setPickingState("idle");
@@ -127,6 +138,7 @@ export function useControlPoints(): UseControlPointsReturn {
     updateMapPoint,
     onUpdateAllMapPoints,
     deletePoint,
+    undoLastPoint,
     clearAll,
   };
 }

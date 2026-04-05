@@ -595,6 +595,7 @@ export function MapViewer({
   const rotHoldPivotRef = useRef<{ lng: number; lat: number } | null>(null);
   const rotHoldBaseGeojsonRef = useRef<GeoJSONFeatureCollection | null>(null);
   const skipRebuildRef = useRef(false);
+  const cumulativeRotDegRef = useRef(0); // total rotation since initial georeferencing
 
   // CTRL+pivot drag refs
   const ctrlPivotDragRef = useRef(false);
@@ -816,7 +817,7 @@ export function MapViewer({
   // ── CTRL+pivot drag event listeners (rotate tool) ───────────────────────
   useEffect(() => {
     if (manualTool !== "rotate") {
-      setDisplayRotDeg(0);
+      // Keep displayRotDeg showing cumulative rotation
       userPivotOverrideRef.current = null;
       if (rotHoldIntervalRef.current !== null) {
         clearInterval(rotHoldIntervalRef.current);
@@ -1605,11 +1606,14 @@ export function MapViewer({
     }
   }, [points]); // eslint-disable-line
 
-  // ── Disable marker drag when rotate/scale active ─────────────────────────
+  // ── Disable marker interaction when rotate/scale active ─────────────────
   useEffect(() => {
     const blockDrag = manualTool === "rotate" || manualTool === "scale";
     for (const marker of markersRef.current) {
       marker.setDraggable(!blockDrag);
+      // Also block all pointer events so clicks/hovers don't register
+      const el = marker.getElement();
+      el.style.pointerEvents = blockDrag ? "none" : "";
     }
   }, [manualTool]);
 
@@ -1624,9 +1628,11 @@ export function MapViewer({
       pivot: [pivot.lng, pivot.lat],
     });
     pushGeojsonRef.current(map, rotated as GeoJSONFeatureCollection);
-    // Normalize display to 0–359 range
-    const displayVal = totalAccumDeg % 360;
-    setDisplayRotDeg(displayVal);
+    // Display cumulative rotation (persists across presses), wrap ±360 → 0
+    let display = cumulativeRotDegRef.current + totalAccumDeg;
+    if (display >= 360) display -= 360;
+    if (display <= -360) display += 360;
+    setDisplayRotDeg(display);
   };
 
   const startHoldRotate = (dir: 1 | -1) => {
@@ -1677,18 +1683,21 @@ export function MapViewer({
     const pivot = rotHoldPivotRef.current;
     const base = rotHoldBaseGeojsonRef.current;
 
-    // Always show markers again
-    for (const m of markersRef.current) {
-      m.getElement().style.opacity = "1";
-      m.getElement().style.pointerEvents = "";
-    }
-
     if (accum === 0 || !pivot || !base) {
+      // Restore markers since no geometry change occurred
+      for (const m of markersRef.current) {
+        m.getElement().style.opacity = "1";
+        m.getElement().style.pointerEvents = "";
+      }
       rotHoldAccumRef.current = 0;
       rotHoldBaseGeojsonRef.current = null;
-      setDisplayRotDeg(0);
+      // Don't reset display — keep cumulative degree value
       return;
     }
+
+    // NOTE: Do NOT restore marker opacity here. The marker useEffect will
+    // rebuild markers at correct rotated positions after state update.
+    // Restoring opacity before state updates causes a visible flash at old positions.
 
     // Commit the final rotated geojson as the new base so rebuildAndPushOverlay
     // doesn't recompute from scratch (which would cause a visual jump)
@@ -1703,36 +1712,50 @@ export function MapViewer({
     // Tell rebuildAndPushOverlay to skip one cycle since we've already committed
     skipRebuildRef.current = true;
 
-    // Update control point lat/lngs to match the rotated geometry.
-    // Clockwise rotation by accum degrees in geographic coords:
-    //   x' = cos(θ)*x + sin(θ)*y
-    //   y' = -sin(θ)*x + cos(θ)*y
-    const rad = (accum * Math.PI) / 180;
-    const cos = Math.cos(rad);
-    const sin = Math.sin(rad);
-    const { lng: pivotLng, lat: pivotLat } = pivot;
-
+    // Update control point lat/lngs using the same geodesic rotation that
+    // turf.transformRotate applies internally. turf rotates using bearing
+    // (clockwise from north) so we must replicate that exactly:
+    //   1. Compute the geodesic bearing from pivot to each point
+    //   2. Compute the geodesic distance (in degrees, approximated)
+    //   3. Add `accum` degrees to the bearing (clockwise = positive)
+    //   4. Reproject back to lng/lat
+    // We account for the cos(lat) factor so longitude degrees are correct.
+    const pivotLatRad = (pivot.lat * Math.PI) / 180;
+    const cosLat = Math.cos(pivotLatRad);
+    const accumRad = (accum * Math.PI) / 180;
     onUpdateAllMapPointsRef.current((prev) =>
       prev.map((p) => {
-        const rx = p.mapLng - pivotLng;
-        const ry = p.mapLat - pivotLat;
-        return {
-          ...p,
-          mapLng: pivotLng + cos * rx + sin * ry,
-          mapLat: pivotLat + -sin * rx + cos * ry,
-        };
+        // Offsets in a locally-flat coordinate system scaled so x and y are
+        // both in the same distance units (using cosLat to convert lng degrees).
+        const dx = (p.mapLng - pivot.lng) * cosLat; // scaled lng offset
+        const dy = p.mapLat - pivot.lat; // lat offset
+        // CW rotation matching turf.transformRotate's bearing convention:
+        //   x' = cos(θ)*x + sin(θ)*y
+        //   y' = -sin(θ)*x + cos(θ)*y
+        const dxRot = Math.cos(accumRad) * dx + Math.sin(accumRad) * dy;
+        const dyRot = -Math.sin(accumRad) * dx + Math.cos(accumRad) * dy;
+        const rx = cosLat === 0 ? 0 : dxRot / cosLat;
+        const ry = dyRot;
+        return { ...p, mapLng: pivot.lng + rx, mapLat: pivot.lat + ry };
       }),
     );
 
+    // Update cumulative rotation tracker and display (wrap ±360 → 0)
+    cumulativeRotDegRef.current += accum;
+    if (cumulativeRotDegRef.current >= 360) cumulativeRotDegRef.current -= 360;
+    if (cumulativeRotDegRef.current <= -360) cumulativeRotDegRef.current += 360;
+    setDisplayRotDeg(cumulativeRotDegRef.current);
+
     rotHoldAccumRef.current = 0;
     rotHoldBaseGeojsonRef.current = null;
-    setDisplayRotDeg(0);
   };
 
   // ── Revert to Original ────────────────────────────────────────────────────
   const handleRevertToOriginal = useCallback(() => {
     const snap = originalSnapshotRef.current;
     if (!snap) return;
+    cumulativeRotDegRef.current = 0;
+    setDisplayRotDeg(0);
     const map = mapRef.current;
     if (!map) return;
     manualDeltaRef.current = {
@@ -1765,6 +1788,8 @@ export function MapViewer({
 
   // ── Clear Georeferencing ──────────────────────────────────────────────────
   const handleClearGeoreferencing = useCallback(() => {
+    cumulativeRotDegRef.current = 0;
+    setDisplayRotDeg(0);
     originalSnapshotRef.current = null;
     hasAutoZoomedRef.current = false;
     manualDeltaRef.current = {

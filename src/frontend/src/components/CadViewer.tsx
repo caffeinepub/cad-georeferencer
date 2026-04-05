@@ -1,4 +1,4 @@
-import { Expand, Hand, MapPin, Maximize2 } from "lucide-react";
+import { Expand, Hand, MapPin, Maximize2, Undo2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PickingState } from "../hooks/useControlPoints";
 import type { DxfData, DxfEntity } from "../utils/dxfRenderer";
@@ -88,6 +88,8 @@ interface CadViewerProps {
   isAddMode: boolean;
   onStartAddMode: () => void;
   onStopAddMode: () => void;
+  onUndoLastPoint?: () => void;
+  onDeletePoint?: (id: number) => void;
 }
 
 export function CadViewer({
@@ -100,6 +102,8 @@ export function CadViewer({
   isAddMode,
   onStartAddMode,
   onStopAddMode,
+  onUndoLastPoint,
+  onDeletePoint,
 }: CadViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -109,6 +113,7 @@ export function CadViewer({
   const scaleRef = useRef(1);
 
   const [renderTick, setRenderTick] = useState(0);
+  const [selectedPinId, setSelectedPinId] = useState<number | null>(null);
   const bumpRender = useCallback(() => setRenderTick((n) => n + 1), []);
 
   const [activeTool, setActiveTool] = useState<ActiveTool>(() => {
@@ -231,7 +236,13 @@ export function CadViewer({
 
       for (const pin of allPins) {
         const pos = toCanvas(pin.cadX, pin.cadY);
-        drawPin(ctx, pos.x, pos.y, pin.id === -1 ? "?" : String(pin.id));
+        drawPin(
+          ctx,
+          pos.x,
+          pos.y,
+          pin.id === -1 ? "?" : String(pin.id),
+          pin.id === selectedPinId,
+        );
       }
 
       // ── Draw snap indicator ────────────────────────────────────────────
@@ -286,6 +297,7 @@ export function CadViewer({
     renderTick,
     activeTool,
     pickingState,
+    selectedPinId,
   ]);
 
   useEffect(() => {
@@ -497,13 +509,27 @@ export function CadViewer({
 
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
-      if (activeTool !== "add-points") return;
-      if (pickingState !== "waiting-cad") return;
       const canvas = canvasRef.current;
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
       const cx = e.clientX - rect.left;
       const cy = e.clientY - rect.top;
+
+      // Check if clicking near an existing pin (hit-test radius 14px)
+      for (const p of points) {
+        const pos = toCanvas(p.cadX, p.cadY);
+        const dist = Math.hypot(cx - pos.x, cy - pos.y);
+        if (dist <= 14) {
+          setSelectedPinId((prev) => (prev === p.id ? null : p.id));
+          return;
+        }
+      }
+
+      // Clicked elsewhere: deselect
+      setSelectedPinId(null);
+
+      if (activeTool !== "add-points") return;
+      if (pickingState !== "waiting-cad") return;
 
       // Use snap vertex if available, otherwise raw world click
       if (snapVertexRef.current) {
@@ -514,7 +540,7 @@ export function CadViewer({
         onCadClick(world.x, world.y);
       }
     },
-    [activeTool, pickingState, toWorld, onCadClick],
+    [activeTool, pickingState, toWorld, toCanvas, onCadClick, points],
   );
 
   const getCursor = () => {
@@ -610,6 +636,24 @@ export function CadViewer({
           }}
         />
         <ToolButton
+          ocid="cad.undo.button"
+          label="Undo Last Point"
+          active={false}
+          onClick={() => {
+            onUndoLastPoint?.();
+            setSelectedPinId(null);
+          }}
+        >
+          <Undo2 size={14} />
+        </ToolButton>
+        <div
+          style={{
+            height: 1,
+            background: "rgba(0,212,255,0.18)",
+            margin: "2px 4px",
+          }}
+        />
+        <ToolButton
           ocid="cad.fit_extent.button"
           label="Fit to Extent"
           active={false}
@@ -618,6 +662,36 @@ export function CadViewer({
           <Expand size={14} />
         </ToolButton>
       </div>
+
+      {selectedPinId !== null && (
+        <div
+          className="absolute flex items-center gap-2 px-3 py-1.5 rounded-sm"
+          style={{
+            top: 12,
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "rgba(255,60,60,0.92)",
+            color: "#fff",
+            zIndex: 20,
+          }}
+        >
+          <span className="text-xs font-mono">
+            Point {selectedPinId} selected
+          </span>
+          <button
+            type="button"
+            data-ocid="cad.delete_button"
+            title="Delete selected point"
+            onClick={() => {
+              onDeletePoint?.(selectedPinId);
+              setSelectedPinId(null);
+            }}
+            className="flex items-center gap-1 text-xs font-mono bg-white/20 hover:bg-white/30 px-2 py-0.5 rounded-sm transition-colors"
+          >
+            <X size={11} /> Delete
+          </button>
+        </div>
+      )}
 
       {activeTool === "add-points" && pickingState === "waiting-cad" && (
         <div
@@ -676,14 +750,23 @@ function drawPin(
   x: number,
   y: number,
   label: string,
+  selected = false,
 ) {
   const r = 11;
   ctx.save();
-  ctx.shadowColor = "#00d4ff";
+  if (selected) {
+    // Selection ring
+    ctx.beginPath();
+    ctx.arc(x, y, r + 5, 0, Math.PI * 2);
+    ctx.strokeStyle = "#ff4444";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+  ctx.shadowColor = selected ? "#ff4444" : "#00d4ff";
   ctx.shadowBlur = 10;
   ctx.beginPath();
   ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.fillStyle = "#00d4ff";
+  ctx.fillStyle = selected ? "#ff4444" : "#00d4ff";
   ctx.fill();
   ctx.strokeStyle = "#0d1b2a";
   ctx.lineWidth = 2;
